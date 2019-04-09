@@ -1164,11 +1164,11 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
 }
 
 void Controller::set_auth_context(const AuthContext* ctx) {
-    if (_auth_context != NULL) {
-        LOG(FATAL) << "Impossible! This function is supposed to be called "
-                 "only once when verification succeeds in server side";
-        return;
-    }
+    //if (_auth_context != NULL) {
+    //    LOG(FATAL) << "Impossible! This function is supposed to be called "
+    //             "only once when verification succeeds in server side";
+    //    return;
+    //}
     // Ownership is belong to `Socket' instead of `Controller'
     _auth_context = ctx;
 }
