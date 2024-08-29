@@ -30,7 +30,7 @@
 
 namespace bthread {
 
-DEFINE_int32(bthread_concurrency, 8 + BTHREAD_EPOLL_THREAD_NUM,
+DEFINE_int32(bthread_concurrency, 0 + BTHREAD_EPOLL_THREAD_NUM,
              "Number of pthread workers");
 
 DEFINE_int32(bthread_min_concurrency, 0,

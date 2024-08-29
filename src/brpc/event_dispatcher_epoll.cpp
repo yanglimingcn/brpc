@@ -200,7 +200,7 @@ void EventDispatcher::Run() {
             n = epoll_wait(_event_dispatcher_fd, e, ARRAY_SIZE(e), -1);
         }
 #else
-        const int n = epoll_wait(_event_dispatcher_fd, e, ARRAY_SIZE(e), -1);
+        const int n = epoll_wait(_event_dispatcher_fd, e, ARRAY_SIZE(e), 0);
 #endif
         if (_stop) {
             // epoll_ctl/epoll_wait should have some sort of memory fencing
@@ -232,6 +232,7 @@ void EventDispatcher::Run() {
                 CallOutputEventCallback(e[i].data.u64, e[i].events, _thread_attr);
             }
         }
+        bthread_yield();
     }
 }
 

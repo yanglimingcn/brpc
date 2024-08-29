@@ -145,7 +145,7 @@ static const size_t BTHREAD_EPOLL_THREAD_NUM = 1;
 static const bthread_t BTHREAD_ATOMIC_INIT = 0;
 
 // Min/Max number of work pthreads.
-static const int BTHREAD_MIN_CONCURRENCY = 3 + BTHREAD_EPOLL_THREAD_NUM;
+static const int BTHREAD_MIN_CONCURRENCY = 0 + BTHREAD_EPOLL_THREAD_NUM;
 static const int BTHREAD_MAX_CONCURRENCY = 1024;
 
 typedef struct {
