@@ -232,7 +232,7 @@ void EventDispatcher::Run() {
                 CallOutputEventCallback(e[i].data.u64, e[i].events, _thread_attr);
             }
         }
-        bthread_yield();
+        // bthread_yield();
     }
 }
 
