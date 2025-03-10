@@ -59,6 +59,12 @@ struct RdmaResource {
     RdmaResource();
     ~RdmaResource();
     DISALLOW_COPY_AND_ASSIGN(RdmaResource);
+    static ibv_cq* GetPollingCq();
+
+private:
+    static std::vector<ibv_cq*> _polling_cqs;
+    static std::atomic<int> _polling_cq_index;
+    static std::once_flag _init_polling_cqs;
 };
 
 class BAIDU_CACHELINE_ALIGNMENT RdmaEndpoint : public SocketUser {
@@ -184,6 +190,9 @@ private:
 
     // Poll CQ and get the work completion
     static void PollCq(Socket* m);
+
+    // Run PollCq in one bthread
+    static void* RunThis(void* arg);
 
     // Get the description of current handshake state
     std::string GetStateStr() const;

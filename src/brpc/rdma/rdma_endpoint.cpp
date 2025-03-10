@@ -58,6 +58,8 @@ DEFINE_int32(rdma_prepared_qp_size, 128, "SQ and RQ size for prepared QP.");
 DEFINE_int32(rdma_prepared_qp_cnt, 1024, "Initial count of prepared QP.");
 DEFINE_bool(rdma_trace_verbose, false, "Print log message verbosely");
 BRPC_VALIDATE_GFLAG(rdma_trace_verbose, brpc::PassValidate);
+DEFINE_bool(rdma_use_polling, false, "Use polling mode for RDMA.");
+DEFINE_int32(rdma_polling_cq_num, 1, "CQ number for RDMA polling mode");
 
 static const size_t IOBUF_BLOCK_HEADER_LEN = 32; // implementation-dependent
 
@@ -139,6 +141,25 @@ void HelloMessage::Deserialize(void* data) {
     lid = butil::NetToHost16(*current_pos++);
     memcpy(gid.raw, current_pos, 16);
     qp_num = butil::NetToHost32(*(uint32_t*)((char*)current_pos + 16));
+}
+
+std::vector<ibv_cq*> RdmaResource::_polling_cqs(FLAGS_rdma_polling_cq_num);
+std::atomic<int> RdmaResource::_polling_cq_index(0);
+std::once_flag RdmaResource::_init_polling_cqs;
+
+ibv_cq* RdmaResource::GetPollingCq() {
+    std::call_once(_init_polling_cqs, [] {
+        for (int i = 0; i < FLAGS_rdma_polling_cq_num; ++i) {
+            auto cq =
+                IbvCreateCq(GetRdmaContext(), 2 * FLAGS_rdma_prepared_qp_size,
+                            NULL, NULL, GetRdmaCompVector());
+            if (cq) {
+                _polling_cqs.push_back(cq);
+            }
+        }
+    });
+    int index = _polling_cq_index.fetch_add(1, std::memory_order_relaxed);
+    return _polling_cqs[index % _polling_cqs.size()];
 }
 
 RdmaResource::RdmaResource() 
@@ -1041,26 +1062,35 @@ static RdmaResource* AllocateQpCq(uint16_t sq_size, uint16_t rq_size) {
         return NULL;
     }
 
-    res->comp_channel = IbvCreateCompChannel(GetRdmaContext());
-    if (!res->comp_channel) {
-        PLOG(WARNING) << "Fail to create comp channel for CQ";
-        delete res;
-        return NULL;
-    }
+    if (!FLAGS_rdma_use_polling) {
+        res->comp_channel = IbvCreateCompChannel(GetRdmaContext());
+        if (!res->comp_channel) {
+            PLOG(WARNING) << "Fail to create comp channel for CQ";
+            delete res;
+            return NULL;
+        }
 
-    butil::make_close_on_exec(res->comp_channel->fd);
-    if (butil::make_non_blocking(res->comp_channel->fd) < 0) {
-        PLOG(WARNING) << "Fail to set comp channel nonblocking";
-        delete res;
-        return NULL;
-    }
+        butil::make_close_on_exec(res->comp_channel->fd);
+        if (butil::make_non_blocking(res->comp_channel->fd) < 0) {
+            PLOG(WARNING) << "Fail to set comp channel nonblocking";
+            delete res;
+            return NULL;
+        }
 
-    res->cq = IbvCreateCq(GetRdmaContext(), 2 * FLAGS_rdma_prepared_qp_size,
-            NULL, res->comp_channel, GetRdmaCompVector());
-    if (!res->cq) {
-        PLOG(WARNING) << "Fail to create CQ";
-        delete res;
-        return NULL;
+        res->cq = IbvCreateCq(GetRdmaContext(), 2 * FLAGS_rdma_prepared_qp_size,
+                              NULL, res->comp_channel, GetRdmaCompVector());
+        if (!res->cq) {
+            PLOG(WARNING) << "Fail to create CQ";
+            delete res;
+            return NULL;
+        }
+    } else {
+        res->cq = RdmaResource::GetPollingCq();
+        if (!res->cq) {
+            PLOG(WARNING) << "Fail to create CQ";
+            delete res;
+            return NULL;
+        }
     }
 
     ibv_qp_init_attr attr;
@@ -1117,19 +1147,28 @@ int RdmaEndpoint::AllocateResources() {
         return -1;
     }
 
-    SocketOptions options;
-    options.user = this;
-    options.keytable_pool = _socket->_keytable_pool;
-    options.fd = _resource->comp_channel->fd;
-    options.on_edge_triggered_events = PollCq;
-    if (Socket::Create(options, &_cq_sid) < 0) {
-        PLOG(WARNING) << "Fail to create socket for cq";
-        return -1;
-    }
+    if (!FLAGS_rdma_use_polling) {
+        SocketOptions options;
+        options.user = this;
+        options.keytable_pool = _socket->_keytable_pool;
+        options.fd = _resource->comp_channel->fd;
+        options.on_edge_triggered_events = PollCq;
+        if (Socket::Create(options, &_cq_sid) < 0) {
+            PLOG(WARNING) << "Fail to create socket for cq";
+            return -1;
+        }
 
-    if (ibv_req_notify_cq(_resource->cq, 1) < 0) {
-        PLOG(WARNING) << "Fail to arm CQ comp channel";
-        return -1;
+        if (ibv_req_notify_cq(_resource->cq, 1) < 0) {
+            PLOG(WARNING) << "Fail to arm CQ comp channel";
+            return -1;
+        }
+    } else {
+        bthread_t tid;
+        if (bthread_start_background(&tid, &BTHREAD_ATTR_NORMAL, RunThis,
+                                     this) != 0) {
+            PLOG(WARNING) << "Fail to start RDMA polling thread";
+            return -1;
+        }
     }
 
     _sbuf.resize(_sq_size - RESERVED_WR_NUM);
@@ -1245,11 +1284,15 @@ void RdmaEndpoint::DeallocateResources() {
             }
             _resource->qp = NULL;
         }
-        if (_resource->cq) {
-            IbvAckCqEvents(_resource->cq, _cq_events);
-            if (IbvDestroyCq(_resource->cq) < 0) {
-                PLOG(WARNING) << "Fail to destroy CQ";
+        if (!FLAGS_rdma_use_polling) {
+            if (_resource->cq) {
+                IbvAckCqEvents(_resource->cq, _cq_events);
+                if (IbvDestroyCq(_resource->cq) < 0) {
+                    PLOG(WARNING) << "Fail to destroy CQ";
+                }
+                _resource->cq = NULL;
             }
+        } else {
             _resource->cq = NULL;
         }
         if (_resource->comp_channel) {
@@ -1280,8 +1323,10 @@ void RdmaEndpoint::DeallocateResources() {
     }
 
     if (move_to_rdma_resource_list) {
-        if (_resource->cq) {
-            IbvAckCqEvents(_resource->cq, _cq_events);
+        if (!FLAGS_rdma_use_polling) {
+            if (_resource->cq) {
+                IbvAckCqEvents(_resource->cq, _cq_events);
+            }
         }
         BAIDU_SCOPED_LOCK(*g_rdma_resource_mutex);
         _resource->next = g_rdma_resource_list;
@@ -1327,12 +1372,14 @@ void RdmaEndpoint::PollCq(Socket* m) {
     }
     CHECK(ep == s->_rdma_ep);
 
-    if (ep->GetAndAckEvents() < 0) {
-        const int saved_errno = errno;
-        PLOG(ERROR) << "Fail to get cq event: " << s->description();
-        s->SetFailed(saved_errno, "Fail to get cq event from %s: %s",
-                s->description().c_str(), berror(saved_errno));
-        return;
+    if (!FLAGS_rdma_use_polling) {
+        if (ep->GetAndAckEvents() < 0) {
+            const int saved_errno = errno;
+            PLOG(ERROR) << "Fail to get cq event: " << s->description();
+            s->SetFailed(saved_errno, "Fail to get cq event from %s: %s",
+                         s->description().c_str(), berror(saved_errno));
+            return;
+        }
     }
 
     int progress = Socket::PROGRESS_INIT;
@@ -1349,31 +1396,38 @@ void RdmaEndpoint::PollCq(Socket* m) {
             return;
         }
         if (cnt == 0) {
-            if (!notified) {
-                // Since RDMA only provides one shot event, we have to call the
-                // notify function every time. Because there is a possibility
-                // that the event arrives after the poll but before the notify,
-                // we should re-poll the CQ once after the notify to check if
-                // there is an available CQE.
-                if (ibv_req_notify_cq(ep->_resource->cq, 1) < 0) {
-                    const int saved_errno = errno;
-                    PLOG(WARNING) << "Fail to arm CQ comp channel: " << s->description();
-                    s->SetFailed(saved_errno, "Fail to arm cq channel from %s: %s",
+            if (!FLAGS_rdma_use_polling) {
+                if (!notified) {
+                    // Since RDMA only provides one shot event, we have to call
+                    // the notify function every time. Because there is a
+                    // possibility that the event arrives after the poll but
+                    // before the notify, we should re-poll the CQ once after
+                    // the notify to check if there is an available CQE.
+                    if (ibv_req_notify_cq(ep->_resource->cq, 1) < 0) {
+                        const int saved_errno = errno;
+                        PLOG(WARNING) << "Fail to arm CQ comp channel: "
+                                      << s->description();
+                        s->SetFailed(
+                            saved_errno, "Fail to arm cq channel from %s: %s",
                             s->description().c_str(), berror(saved_errno));
+                        return;
+                    }
+                    notified = true;
+                    continue;
+                }
+                if (!m->MoreReadEvents(&progress)) {
+                    break;
+                }
+                if (ep->GetAndAckEvents() < 0) {
+                    s->SetFailed(errno, "Fail to ack CQ event on %s",
+                                 s->description().c_str());
                     return;
                 }
-                notified = true;
-                continue;
+                notified = false;
+            } else {
+                last_msg.reset(nullptr);
+                bthread_yield();  // yield to schedule other tasks
             }
-            if (!m->MoreReadEvents(&progress)) {
-                break;
-            }
-            if (ep->GetAndAckEvents() < 0) {
-                s->SetFailed(errno, "Fail to ack CQ event on %s",
-                        s->description().c_str());
-                return;
-            }
-            notified = false;
             continue;
         }
         notified = false;
@@ -1413,6 +1467,12 @@ void RdmaEndpoint::PollCq(Socket* m) {
             return;
         }
     }
+}
+
+void* RdmaEndpoint::RunThis(void* arg) {
+    auto ep = static_cast<RdmaEndpoint*>(arg);
+    PollCq(ep->_socket);
+    return nullptr;
 }
 
 std::string RdmaEndpoint::GetStateStr() const {
